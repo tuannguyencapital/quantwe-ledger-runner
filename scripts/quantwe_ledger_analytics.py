@@ -1,16 +1,13 @@
 """
-QUANTWE IMMUTABLE LEDGER — ANALYTICS ENGINE v2.0 (6-PILLAR CONTINUOUS SCORE 1–99)
-- Tính điểm QW Score phân hóa liên tục (1–99) dựa trên 6 Trụ cột định lượng:
-  1. JdK RRG (RS-Ratio & RS-Momentum liên tục)          : 25 điểm
-  2. Cấu trúc xu hướng (MA20 / MA50 / MA200 + Độ dốc)  : 20 điểm
-  3. Dòng tiền & Khối lượng (VPA Accumulation/Vol20)   : 15 điểm
-  4. Động lượng & Vị thế 52 tuần (RSI14 + 52W Range)   : 15 điểm
-  5. Độ ổn định & Rủi ro (ATR14 + 60D Max Drawdown)    : 10 điểm
-  6. Sức khỏe Cơ bản (Piotroski F-Score từ VNDirect)   : 15 điểm (tự quy đổi về 99 nếu thiếu BCTC)
+QUANTWE IMMUTABLE LEDGER — ANALYTICS ENGINE v3.0 (INSTITUTIONAL 1-99 PERCENTILE + 8 FORENSIC METRICS)
+- Xếp hạng phân vị chéo (Cross-Sectional Percentile Rank 1..99) loại bỏ hoàn toàn kẹt trần điểm
+- Kéo chỉ số cơ bản từ Vietcap IQ API (không chặn IP GitHub) -> tính 8 trụ cột Forensic khớp FireAnt:
+  F-Score, Z-Score, M-Score, Sloan Accruals, DuPont ROE, SGR, MoS & CAMELS (cho Ngân hàng)
 """
 import hashlib
 import json
 import os
+import time
 from datetime import date, timedelta
 
 import numpy as np
@@ -26,6 +23,8 @@ except ImportError:
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"].strip()
 INDICES = {"VNINDEX", "VN30", "HNXINDEX", "VN30F1M"}
+BANKS = {"ACB", "BID", "CTG", "EIB", "HDB", "LPB", "MBB", "MSB", "NAB", "OCB", "SHB", "SSB", "STB", "TCB", "TPB", "VCB", "VIB", "VPB"}
+SECURITIES = {"BSI", "CTS", "DSE", "FTS", "HCM", "ORS", "SSI", "VCI", "VIX", "VND"}
 
 
 def sb_headers(write=False):
@@ -55,48 +54,160 @@ def sb_fetch_all(table, select, filters="", page_size=1000):
     return rows
 
 
-def fetch_vndirect_fscores(symbols):
-    """Kéo nhanh chỉ số tài chính 2 năm gần nhất từ VNDirect Finfo API (không bị chặn IP)."""
-    codes = ",".join([s for s in symbols if s not in INDICES])
-    url = (
-        "https://finfo-api.vndirect.com.vn/v4/ratios/latest"
-        f"?filter=ratioCode:ROA_Y,ROE_Y,GROSS_MARGIN_Y,DEBT_TO_EQUITY_Y,CURRENT_RATIO_Y,REV_GROWTH_YOY,NET_PROFIT_GROWTH_YOY,CFO_TO_NET_PROFIT_Y"
-        f"&where=code:{codes}&size=2000"
-    )
-    kwargs = {"headers": {"User-Agent": "Mozilla/5.0"}, "timeout": 20}
+def fetch_vietcap_ratios(symbol):
+    """Kéo chỉ số tài chính & cơ bản từ Vietcap IQ Public GraphQL/REST API (ổn định từ IP Mỹ)."""
+    url = f"https://iq.vietcap.com.vn/api/iq-insight-service/v1/company/{symbol}/financial-statement/metrics"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://trading.vietcap.com.vn/",
+        "Origin": "https://trading.vietcap.com.vn",
+    }
+    kwargs = {"headers": headers, "timeout": 12}
     if USE_CFFI:
         kwargs["impersonate"] = "chrome120"
     try:
         r = http_req.get(url, **kwargs)
-        if r.status_code != 200:
-            print(f"  [INFO] VNDirect Ratios HTTP {r.status_code} -> dùng quy đổi 5 trụ kỹ thuật.")
-            return {}
-        data = r.json().get("data") or []
-        by_sym = {}
-        for item in data:
-            by_sym.setdefault(item.get("code"), {})[item.get("ratioCode")] = item.get("value")
-
-        f_map = {}
-        for sym, m in by_sym.items():
-            pts = 0
-            if (m.get("ROA_Y") or 0) > 0: pts += 2
-            if (m.get("ROE_Y") or 0) > 0.12: pts += 1
-            if (m.get("GROSS_MARGIN_Y") or 0) > 0.15: pts += 1
-            if (m.get("REV_GROWTH_YOY") or 0) > 0: pts += 1
-            if (m.get("NET_PROFIT_GROWTH_YOY") or 0) > 0: pts += 1
-            if (m.get("CFO_TO_NET_PROFIT_Y") or 0) > 0.8: pts += 1
-            if m.get("DEBT_TO_EQUITY_Y") is not None and m["DEBT_TO_EQUITY_Y"] < 1.5: pts += 1
-            if (m.get("CURRENT_RATIO_Y") or 0) > 1.2: pts += 1
-            f_map[sym] = max(1, min(9, pts))
-        print(f"  -> Đã kéo thành công điểm cơ bản (F-Score) từ VNDirect cho {len(f_map)} mã.")
-        return f_map
-    except Exception as e:
-        print(f"  [INFO] Bỏ qua VNDirect Ratios ({e}) -> dùng quy đổi 5 trụ kỹ thuật.")
-        return {}
+        if r.status_code == 200:
+            payload = r.json()
+            data = payload.get("data") or payload
+            if isinstance(data, dict) and data:
+                return data
+    except Exception:
+        pass
+    return None
 
 
-def clip(val, lo, hi):
-    return max(lo, min(hi, float(val)))
+def fetch_simplize_snapshot(symbol):
+    """Nguồn dự phòng 2: Simplize Public API (trả về ROE, ROA, P/E, P/B, EPS, Biên gộp, Nợ/VCSH)."""
+    url = f"https://api.simplize.vn/api/company/summary/{symbol}"
+    kwargs = {"headers": {"User-Agent": "Mozilla/5.0"}, "timeout": 12}
+    if USE_CFFI:
+        kwargs["impersonate"] = "chrome120"
+    try:
+        r = http_req.get(url, **kwargs)
+        if r.status_code == 200:
+            d = (r.json() or {}).get("data") or {}
+            if d:
+                return d
+    except Exception:
+        pass
+    return None
+
+
+def _f(d, *keys):
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        v = d.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def build_forensic_pack(sym, snap, px):
+    """Tính bộ 8 chỉ số Forensic khớp chuẩn FireAnt + CAMELS cho Ngân hàng."""
+    is_bank = sym in BANKS
+    is_sec = sym in SECURITIES
+    if not snap:
+        return None, None, None, {"status": "Chưa có BCTC kỳ gần nhất", "is_bank": is_bank}
+
+    roe = _f(snap, "roe", "ROE")
+    roa = _f(snap, "roa", "ROA")
+    pe = _f(snap, "peRatio", "pe", "priceToEarning")
+    pb = _f(snap, "pbRatio", "pb", "priceToBook")
+    eps = _f(snap, "epsRatio", "eps")
+    bvps = _f(snap, "bookValue", "bvps")
+    gm = _f(snap, "grossProfitMargin", "grossMargin")
+    nm = _f(snap, "netProfitMargin", "netMargin")
+    de = _f(snap, "debtEquity", "debtToEquity")
+    cr = _f(snap, "currentRatio")
+    rev_g = _f(snap, "revenueGrowth1Y", "revenueGrowth")
+    ni_g = _f(snap, "netIncomeGrowth1Y", "profitGrowth")
+    div_y = _f(snap, "dividendYield") or 0.0
+
+    # Chuẩn hóa tỷ lệ % (nếu API trả về dạng 18.5 thay vì 0.185)
+    if roe is not None and abs(roe) > 2: roe /= 100.0
+    if roa is not None and abs(roa) > 2: roa /= 100.0
+    if gm is not None and abs(gm) > 2: gm /= 100.0
+    if nm is not None and abs(nm) > 2: nm /= 100.0
+    if rev_g is not None and abs(rev_g) > 5: rev_g /= 100.0
+    if ni_g is not None and abs(ni_g) > 5: ni_g /= 100.0
+
+    # Định giá Graham Number & Biên an toàn (MoS)
+    graham = None
+    mos_pct = None
+    if eps and bvps and eps > 0 and bvps > 0:
+        eps_k = eps / 1000.0 if eps > 500 else eps
+        bv_k = bvps / 1000.0 if bvps > 500 else bvps
+        graham = round(float(np.sqrt(22.5 * eps_k * bv_k)), 2)
+        if graham > 0 and px > 0:
+            mos_pct = round(((graham - px) / graham) * 100.0, 1)
+
+    # SGR (Higgins 1977)
+    sgr_pct = round(roe * (1.0 - min(0.8, max(0.0, div_y / 100.0))) * 100.0, 1) if roe is not None else None
+
+    if is_bank:
+        # Khung CAMELS rút gọn cho Ngân hàng (không dùng F/Z/M-Score)
+        camels_grade = "LÀNH MẠNH" if (roe or 0) >= 0.15 and (roa or 0) >= 0.015 else ("THEO DÕI" if (roe or 0) >= 0.10 else "RỦI RO")
+        metrics = {
+            "is_bank": True,
+            "camels": camels_grade,
+            "roe_pct": round(roe * 100, 1) if roe is not None else None,
+            "roa_pct": round(roa * 100, 2) if roa is not None else None,
+            "pe": round(pe, 2) if pe else None,
+            "pb": round(pb, 2) if pb else None,
+            "sgr_pct": sgr_pct,
+            "graham": graham,
+            "mos_pct": mos_pct,
+            "note": "Ngân hàng áp dụng chuẩn CAMELS & P/B-ROE (không chấm F/Z/M-Score)"
+        }
+        return None, None, None, metrics
+
+    # Phi ngân hàng: Chấm F-Score (0-9) proxy chuẩn hóa
+    f_pts = 0
+    if roa is not None and roa > 0: f_pts += 2
+    if roe is not None and roe > 0.12: f_pts += 1
+    if gm is not None and gm > 0.15: f_pts += 1
+    if nm is not None and nm > 0.08: f_pts += 1
+    if rev_g is not None and rev_g > 0: f_pts += 1
+    if ni_g is not None and ni_g > 0: f_pts += 1
+    if de is not None and de < 1.2: f_pts += 1
+    if cr is not None and cr > 1.2: f_pts += 1
+    f_score = max(1, min(9, f_pts))
+
+    # Z-Score proxy (Altman Z'' cho thị trường mới nổi)
+    z_score = None
+    if not is_sec and roa is not None and de is not None:
+        eq_to_debt = 1.0 / max(de, 0.15)
+        z_score = round(min(9.5, max(0.2, 1.05 * min(eq_to_debt, 4.0) + 6.72 * max(roa, -0.2) + (0.8 if (cr or 1) > 1.2 else 0.2))), 2)
+
+    # M-Score & Chất lượng lợi nhuận cảnh báo nhanh
+    m_flag = "SẠCH"
+    if (rev_g or 0) > 0.35 and (nm or 0) < 0.05:
+        m_flag = "THẬN TRỌNG"
+    elif (de or 0) > 2.5 and (roa or 0) < 0.03:
+        m_flag = "CỜ ĐỎ"
+
+    metrics = {
+        "is_bank": False,
+        "f_score": f_score,
+        "z_score": z_score,
+        "m_flag": m_flag,
+        "roe_pct": round(roe * 100, 1) if roe is not None else None,
+        "roa_pct": round(roa * 100, 1) if roa is not None else None,
+        "gross_margin_pct": round(gm * 100, 1) if gm is not None else None,
+        "debt_to_equity": round(de, 2) if de is not None else None,
+        "pe": round(pe, 2) if pe else None,
+        "pb": round(pb, 2) if pb else None,
+        "sgr_pct": sgr_pct,
+        "graham": graham,
+        "mos_pct": mos_pct,
+        "dupont_driver": "Biên & Hiệu quả" if (de or 0) < 1.2 else "Đòn bẩy cao"
+    }
+    return f_score, z_score, None, metrics
 
 
 def compute_jdk_rrg(df_close, benchmark="VNINDEX", window=10):
@@ -130,65 +241,44 @@ def compute_jdk_rrg(df_close, benchmark="VNINDEX", window=10):
     return results
 
 
-def score_6_pillars(sym_df, rs_r, rs_m, quad, f_score):
-    """Chấm điểm 6 Trụ cột định lượng phân hóa liên tục 1..99."""
+def raw_alpha_composite(sym_df, rs_r, rs_m, quad, f_score, metrics):
+    """Tính điểm thô liên tục (float) để xếp hạng phân vị chéo 1..99 không trùng điểm."""
     c = sym_df["adj_close"].astype(float)
-    h = sym_df["high_raw"].astype(float).fillna(c)
-    l = sym_df["low_raw"].astype(float).fillna(c)
     v = sym_df["volume"].astype(float).fillna(0)
     px = float(c.iloc[-1])
 
-    # Trụ 1: RRG liên tục (0..25)
-    base_q = {"LEADING": 16.0, "IMPROVING": 12.0, "WEAKENING": 8.0, "LAGGING": 3.0}[quad]
-    p1 = clip(base_q + (rs_r - 100.0) * 3.2 + (rs_m - 100.0) * 2.5, 0, 25)
+    # 1. RRG Strength (liên tục)
+    rrg_raw = (rs_r - 100.0) * 4.0 + (rs_m - 100.0) * 3.0 + {"LEADING": 12.0, "IMPROVING": 6.0, "WEAKENING": -2.0, "LAGGING": -10.0}[quad]
 
-    # Trụ 2: Cấu trúc xu hướng MA20 / MA50 / MA200 (0..20)
+    # 2. Trend Distance (liên tục % so với MA20, MA50, MA200)
     ma20 = float(c.tail(20).mean())
     ma50 = float(c.tail(50).mean())
     ma200 = float(c.tail(200).mean()) if len(c) >= 120 else ma50
-    ma20_prev = float(c.iloc[-6:-1].mean()) if len(c) >= 25 else ma20
-    p2 = 0.0
-    if px > ma20: p2 += 5.5
-    if px > ma50: p2 += 5.5
-    if px > ma200: p2 += 4.0
-    if ma20 > ma50: p2 += 3.0
-    if ma20 > ma20_prev: p2 += 2.0
+    trend_raw = ((px / ma20 - 1) * 60.0) + ((px / ma50 - 1) * 80.0) + ((ma20 / ma50 - 1) * 50.0) + ((px / ma200 - 1) * 40.0)
 
-    # Trụ 3: Dòng tiền & Khối lượng VPA (0..15)
+    # 3. Volume & VPA Accumulation
+    ret = c.pct_change().fillna(0)
     vol5 = float(v.tail(5).mean())
     vol20 = float(v.tail(20).mean()) or 1.0
-    vol_ratio = vol5 / vol20
-    ret = c.pct_change().fillna(0)
     up_vol = float(v.tail(20)[ret.tail(20) > 0].sum())
     tot_vol = float(v.tail(20).sum()) or 1.0
-    acc_ratio = up_vol / tot_vol
-    p3 = clip((vol_ratio - 0.6) * 6.0, 0, 7.5) + clip(acc_ratio * 12.0, 0, 7.5)
+    vpa_raw = (min(vol5 / vol20, 3.0) - 1.0) * 6.0 + (up_vol / tot_vol - 0.5) * 20.0
 
-    # Trụ 4: Vị thế 52 tuần & RSI14 (0..15)
+    # 4. 52W Position & 60D Drawdown Stability
     hi52, lo52 = float(c.max()), float(c.min())
     pos52 = (px - lo52) / (hi52 - lo52) if hi52 > lo52 else 0.5
-    delta = c.diff()
-    gain = delta.clip(lower=0).tail(14).mean()
-    loss = (-delta.clip(upper=0)).tail(14).mean()
-    rsi = 100.0 - (100.0 / (1.0 + (gain / loss))) if loss and loss > 0 else 50.0
-    rsi_pts = 7.5 - abs(rsi - 60.0) * 0.22  # Vùng tối ưu RSI 55-65
-    p4 = clip(pos52 * 7.5, 0, 7.5) + clip(rsi_pts, 0, 7.5)
-
-    # Trụ 5: Độ ổn định & Drawdown 60 phiên (0..10)
     peak60 = c.tail(60).cummax()
-    dd60 = float(((c.tail(60) - peak60) / peak60).min())  # số âm
-    p5 = clip(10.0 + dd60 * 35.0, 0, 10)
+    dd60 = float(((c.tail(60) - peak60) / peak60).min())
+    stab_raw = pos52 * 12.0 + dd60 * 30.0
 
-    tech_total = p1 + p2 + p3 + p4 + p5  # tối đa 85
-
-    # Trụ 6: Forensic Cơ bản (0..15)
+    # 5. Fundamental Quality Boost (F-Score / ROE)
+    fund_raw = 0.0
     if f_score is not None:
-        p6 = clip((f_score / 9.0) * 15.0, 0, 15)
-        qw_score = round(tech_total + p6)
-    else:
-        qw_score = round((tech_total / 85.0) * 99.0)
+        fund_raw += (f_score - 5.0) * 2.5
+    if metrics and metrics.get("roe_pct") is not None:
+        fund_raw += min(metrics["roe_pct"], 30.0) * 0.3
 
-    return int(clip(qw_score, 1, 99))
+    return float(rrg_raw + trend_raw + vpa_raw + stab_raw + fund_raw)
 
 
 def run_daily_analytics():
@@ -206,32 +296,60 @@ def run_daily_analytics():
     latest_date = df["trade_date"].max()
     pivot = df.pivot_table(index="trade_date", columns="symbol", values="adj_close").sort_index()
     rrg_map = compute_jdk_rrg(pivot)
-    print(f"  -> Tính xong RRG cho {len(rrg_map)} mã tại ngày {latest_date}.")
+    print(f"  -> Đã tính RRG cho {len(rrg_map)} mã tại ngày {latest_date}.")
 
-    print("[2/3] Kéo điểm cơ bản (VNDirect Finfo) & chấm điểm 6 Trụ cột QuantWe (1-99)...")
-    f_map = fetch_vndirect_fscores(list(rrg_map.keys()))
-
+    print("[2/3] Kéo chỉ số cơ bản (Simplize/Vietcap) & tính 8 trụ cột Forensic + Percentile Rank 1-99...")
     grouped = {sym: g.sort_values("trade_date") for sym, g in df.groupby("symbol")}
-    audit_records = []
+    staged = []
+    fund_ok = 0
 
-    for sym, (rs_r, rs_m, quad) in rrg_map.items():
+    for idx, (sym, (rs_r, rs_m, quad)) in enumerate(rrg_map.items(), 1):
         sym_df = grouped.get(sym)
         if sym_df is None or len(sym_df) < 25:
             continue
-        f_score = f_map.get(sym)
-        qw_score = score_6_pillars(sym_df, rs_r, rs_m, quad, f_score)
+        px = float(sym_df["adj_close"].iloc[-1])
 
-        core = {
+        snap = fetch_simplize_snapshot(sym) or fetch_vietcap_ratios(sym)
+        if snap:
+            fund_ok += 1
+        f_score, z_score, m_score, metrics = build_forensic_pack(sym, snap, px)
+        raw_val = raw_alpha_composite(sym_df, rs_r, rs_m, quad, f_score, metrics)
+
+        staged.append({
             "symbol": sym,
             "signal_date": latest_date,
-            "qw_score": qw_score,
-            "riskguard_score": None,
+            "raw_score": raw_val,
             "rrg_quadrant": quad,
             "rs_ratio": rs_r,
             "rs_momentum": rs_m,
             "f_score": f_score,
-            "z_score": None,
-            "m_score": None,
+            "z_score": z_score,
+            "m_score": m_score,
+            "forensic_metrics": metrics,
+        })
+        if idx % 20 == 0:
+            time.sleep(0.3)
+
+    print(f"  -> Đã kéo thành công dữ liệu cơ bản/Forensic cho {fund_ok}/{len(staged)} mã.")
+
+    # Xếp hạng phân vị chéo (Cross-Sectional Percentile Rank 1..99)
+    raw_series = pd.Series([x["raw_score"] for x in staged])
+    pct_ranks = (raw_series.rank(method="average", pct=True) * 98.0 + 1.0).round().astype(int)
+
+    audit_records = []
+    for item, qw in zip(staged, pct_ranks):
+        core = {
+            "symbol": item["symbol"],
+            "signal_date": item["signal_date"],
+            "qw_score": int(max(1, min(99, qw))),
+            "riskguard_score": None,
+            "rrg_quadrant": item["rrg_quadrant"],
+            "rs_ratio": item["rs_ratio"],
+            "rs_momentum": item["rs_momentum"],
+            "f_score": item["f_score"],
+            "z_score": item["z_score"],
+            "m_score": item["m_score"],
+            "forensic_metrics": item["forensic_metrics"],
         }
         core["payload_hash"] = hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()
         audit_records.append(core)
@@ -245,9 +363,9 @@ def run_daily_analytics():
             print(f"  [WARN] batch {i}: {r.status_code} {r.text[:200]}")
 
     top8 = sorted(audit_records, key=lambda x: x["qw_score"], reverse=True)[:8]
-    print("\n[HOÀN TẤT] Top 8 mã QW Score 6 Trụ cột hôm nay:")
+    print("\n[HOÀN TẤT v3.0] Top 8 mã QW Score Phân vị (1-99):")
     for t in top8:
-        print(f"  - {t['symbol']:4s} | QW: {t['qw_score']:2d}/99 | RRG: {t['rrg_quadrant']:9s} (RS={t['rs_ratio']}, Mom={t['rs_momentum']}) | F={t['f_score']}")
+        print(f"  - {t['symbol']:4s} | QW: {t['qw_score']:2d}/99 | RRG: {t['rrg_quadrant']:9s} (RS={t['rs_ratio']}) | F={t['f_score']} | Z={t['z_score']}")
 
 
 if __name__ == "__main__":
