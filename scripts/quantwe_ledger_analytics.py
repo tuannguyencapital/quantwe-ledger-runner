@@ -1,9 +1,12 @@
 """
-QUANTWE IMMUTABLE LEDGER — GIAI ĐOẠN 2: ANALYTICS ENGINE (CHUẨN KHÓA sb_secret_...)
-Tự tính:
-  1. JdK RRG (RS-Ratio, RS-Momentum, 4 góc phần tư so với VNINDEX)
-  2. Piotroski F-Score (0-9), Altman Z-Score (phi tài chính), Beneish M-Score
-  3. Chốt dấu SHA-256 & ghi Append-Only vào bảng ledger_signals_audit
+QUANTWE IMMUTABLE LEDGER — ANALYTICS ENGINE v2.0 (6-PILLAR CONTINUOUS SCORE 1–99)
+- Tính điểm QW Score phân hóa liên tục (1–99) dựa trên 6 Trụ cột định lượng:
+  1. JdK RRG (RS-Ratio & RS-Momentum liên tục)          : 25 điểm
+  2. Cấu trúc xu hướng (MA20 / MA50 / MA200 + Độ dốc)  : 20 điểm
+  3. Dòng tiền & Khối lượng (VPA Accumulation/Vol20)   : 15 điểm
+  4. Động lượng & Vị thế 52 tuần (RSI14 + 52W Range)   : 15 điểm
+  5. Độ ổn định & Rủi ro (ATR14 + 60D Max Drawdown)    : 10 điểm
+  6. Sức khỏe Cơ bản (Piotroski F-Score từ VNDirect)   : 15 điểm (tự quy đổi về 99 nếu thiếu BCTC)
 """
 import hashlib
 import json
@@ -12,14 +15,20 @@ from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
-import requests
+
+try:
+    from curl_cffi import requests as http_req
+    USE_CFFI = True
+except ImportError:
+    import requests as http_req
+    USE_CFFI = False
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"].strip()
+INDICES = {"VNINDEX", "VN30", "HNXINDEX", "VN30F1M"}
 
 
 def sb_headers(write=False):
-    """Tự động nhận diện khóa mới sb_secret_... (bỏ Authorization) và khóa cũ eyJ..."""
     h = {"apikey": SUPABASE_SERVICE_KEY}
     if SUPABASE_SERVICE_KEY.startswith("eyJ"):
         h["Authorization"] = f"Bearer {SUPABASE_SERVICE_KEY}"
@@ -34,7 +43,7 @@ def sb_fetch_all(table, select, filters="", page_size=1000):
     hdr = sb_headers(write=False)
     while True:
         url = f"{SUPABASE_URL}/rest/v1/{table}?select={select}{filters}&limit={page_size}&offset={offset}"
-        r = requests.get(url, headers=hdr, timeout=30)
+        r = http_req.get(url, headers=hdr, timeout=30)
         r.raise_for_status()
         batch = r.json()
         if not batch:
@@ -46,157 +55,171 @@ def sb_fetch_all(table, select, filters="", page_size=1000):
     return rows
 
 
-# ----------------------------------------------------------------------------
-# 1. ĐỒ THỊ RRG CHUẨN JdK (RS-RATIO & RS-MOMENTUM)
-# ----------------------------------------------------------------------------
-def compute_jdk_rrg(df_prices, benchmark="VNINDEX", window=10):
-    if benchmark not in df_prices.columns:
-        return {}
-    bench = df_prices[benchmark].ffill()
-    results = {}
+def fetch_vndirect_fscores(symbols):
+    """Kéo nhanh chỉ số tài chính 2 năm gần nhất từ VNDirect Finfo API (không bị chặn IP)."""
+    codes = ",".join([s for s in symbols if s not in INDICES])
+    url = (
+        "https://finfo-api.vndirect.com.vn/v4/ratios/latest"
+        f"?filter=ratioCode:ROA_Y,ROE_Y,GROSS_MARGIN_Y,DEBT_TO_EQUITY_Y,CURRENT_RATIO_Y,REV_GROWTH_YOY,NET_PROFIT_GROWTH_YOY,CFO_TO_NET_PROFIT_Y"
+        f"&where=code:{codes}&size=2000"
+    )
+    kwargs = {"headers": {"User-Agent": "Mozilla/5.0"}, "timeout": 20}
+    if USE_CFFI:
+        kwargs["impersonate"] = "chrome120"
+    try:
+        r = http_req.get(url, **kwargs)
+        if r.status_code != 200:
+            print(f"  [INFO] VNDirect Ratios HTTP {r.status_code} -> dùng quy đổi 5 trụ kỹ thuật.")
+            return {}
+        data = r.json().get("data") or []
+        by_sym = {}
+        for item in data:
+            by_sym.setdefault(item.get("code"), {})[item.get("ratioCode")] = item.get("value")
 
-    for sym in df_prices.columns:
-        if sym in ("VNINDEX", "VN30", "HNXINDEX", "VN30F1M"):
+        f_map = {}
+        for sym, m in by_sym.items():
+            pts = 0
+            if (m.get("ROA_Y") or 0) > 0: pts += 2
+            if (m.get("ROE_Y") or 0) > 0.12: pts += 1
+            if (m.get("GROSS_MARGIN_Y") or 0) > 0.15: pts += 1
+            if (m.get("REV_GROWTH_YOY") or 0) > 0: pts += 1
+            if (m.get("NET_PROFIT_GROWTH_YOY") or 0) > 0: pts += 1
+            if (m.get("CFO_TO_NET_PROFIT_Y") or 0) > 0.8: pts += 1
+            if m.get("DEBT_TO_EQUITY_Y") is not None and m["DEBT_TO_EQUITY_Y"] < 1.5: pts += 1
+            if (m.get("CURRENT_RATIO_Y") or 0) > 1.2: pts += 1
+            f_map[sym] = max(1, min(9, pts))
+        print(f"  -> Đã kéo thành công điểm cơ bản (F-Score) từ VNDirect cho {len(f_map)} mã.")
+        return f_map
+    except Exception as e:
+        print(f"  [INFO] Bỏ qua VNDirect Ratios ({e}) -> dùng quy đổi 5 trụ kỹ thuật.")
+        return {}
+
+
+def clip(val, lo, hi):
+    return max(lo, min(hi, float(val)))
+
+
+def compute_jdk_rrg(df_close, benchmark="VNINDEX", window=10):
+    if benchmark not in df_close.columns:
+        return {}
+    bench = df_close[benchmark].ffill()
+    results = {}
+    for sym in df_close.columns:
+        if sym in INDICES:
             continue
-        s = df_prices[sym].ffill()
+        s = df_close[sym].ffill()
         rs = (s / bench) * 100.0
         rs_ma = rs.rolling(window).mean()
         rs_std = rs.rolling(window).std(ddof=0).replace(0, np.nan)
-        rs_ratio = 100.0 + ((rs - rs_ma) / rs_std)
-        rs_ratio_smooth = rs_ratio.rolling(window).mean()
+        rs_ratio = (100.0 + ((rs - rs_ma) / rs_std)).rolling(window).mean()
 
-        mom_raw = rs_ratio_smooth.pct_change(1) * 100.0
+        mom_raw = rs_ratio.pct_change(1) * 100.0
         mom_ma = mom_raw.rolling(window).mean()
         mom_std = mom_raw.rolling(window).std(ddof=0).replace(0, np.nan)
-        rs_mom = 100.0 + ((mom_raw - mom_ma) / mom_std)
-        rs_mom_smooth = rs_mom.rolling(window).mean()
+        rs_mom = (100.0 + ((mom_raw - mom_ma) / mom_std)).rolling(window).mean()
 
-        r_val = rs_ratio_smooth.dropna()
-        m_val = rs_mom_smooth.dropna()
+        r_val, m_val = rs_ratio.dropna(), rs_mom.dropna()
         if r_val.empty or m_val.empty:
             continue
         rr, rm = float(r_val.iloc[-1]), float(m_val.iloc[-1])
-
-        if rr >= 100 and rm >= 100:
-            quad = "LEADING"
-        elif rr >= 100 and rm < 100:
-            quad = "WEAKENING"
-        elif rr < 100 and rm < 100:
-            quad = "LAGGING"
-        else:
-            quad = "IMPROVING"
-
+        if rr >= 100 and rm >= 100: quad = "LEADING"
+        elif rr >= 100 and rm < 100: quad = "WEAKENING"
+        elif rr < 100 and rm < 100: quad = "LAGGING"
+        else: quad = "IMPROVING"
         results[sym] = (round(rr, 2), round(rm, 2), quad)
     return results
 
 
-# ----------------------------------------------------------------------------
-# 2. FORENSIC HEALTH: PIOTROSKI F-SCORE, ALTMAN Z-SCORE, BENEISH M-SCORE
-# ----------------------------------------------------------------------------
-def _num(d, *keys):
-    for k in keys:
-        v = d.get(k)
-        if v is not None:
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                pass
-    return None
+def score_6_pillars(sym_df, rs_r, rs_m, quad, f_score):
+    """Chấm điểm 6 Trụ cột định lượng phân hóa liên tục 1..99."""
+    c = sym_df["adj_close"].astype(float)
+    h = sym_df["high_raw"].astype(float).fillna(c)
+    l = sym_df["low_raw"].astype(float).fillna(c)
+    v = sym_df["volume"].astype(float).fillna(0)
+    px = float(c.iloc[-1])
+
+    # Trụ 1: RRG liên tục (0..25)
+    base_q = {"LEADING": 16.0, "IMPROVING": 12.0, "WEAKENING": 8.0, "LAGGING": 3.0}[quad]
+    p1 = clip(base_q + (rs_r - 100.0) * 3.2 + (rs_m - 100.0) * 2.5, 0, 25)
+
+    # Trụ 2: Cấu trúc xu hướng MA20 / MA50 / MA200 (0..20)
+    ma20 = float(c.tail(20).mean())
+    ma50 = float(c.tail(50).mean())
+    ma200 = float(c.tail(200).mean()) if len(c) >= 120 else ma50
+    ma20_prev = float(c.iloc[-6:-1].mean()) if len(c) >= 25 else ma20
+    p2 = 0.0
+    if px > ma20: p2 += 5.5
+    if px > ma50: p2 += 5.5
+    if px > ma200: p2 += 4.0
+    if ma20 > ma50: p2 += 3.0
+    if ma20 > ma20_prev: p2 += 2.0
+
+    # Trụ 3: Dòng tiền & Khối lượng VPA (0..15)
+    vol5 = float(v.tail(5).mean())
+    vol20 = float(v.tail(20).mean()) or 1.0
+    vol_ratio = vol5 / vol20
+    ret = c.pct_change().fillna(0)
+    up_vol = float(v.tail(20)[ret.tail(20) > 0].sum())
+    tot_vol = float(v.tail(20).sum()) or 1.0
+    acc_ratio = up_vol / tot_vol
+    p3 = clip((vol_ratio - 0.6) * 6.0, 0, 7.5) + clip(acc_ratio * 12.0, 0, 7.5)
+
+    # Trụ 4: Vị thế 52 tuần & RSI14 (0..15)
+    hi52, lo52 = float(c.max()), float(c.min())
+    pos52 = (px - lo52) / (hi52 - lo52) if hi52 > lo52 else 0.5
+    delta = c.diff()
+    gain = delta.clip(lower=0).tail(14).mean()
+    loss = (-delta.clip(upper=0)).tail(14).mean()
+    rsi = 100.0 - (100.0 / (1.0 + (gain / loss))) if loss and loss > 0 else 50.0
+    rsi_pts = 7.5 - abs(rsi - 60.0) * 0.22  # Vùng tối ưu RSI 55-65
+    p4 = clip(pos52 * 7.5, 0, 7.5) + clip(rsi_pts, 0, 7.5)
+
+    # Trụ 5: Độ ổn định & Drawdown 60 phiên (0..10)
+    peak60 = c.tail(60).cummax()
+    dd60 = float(((c.tail(60) - peak60) / peak60).min())  # số âm
+    p5 = clip(10.0 + dd60 * 35.0, 0, 10)
+
+    tech_total = p1 + p2 + p3 + p4 + p5  # tối đa 85
+
+    # Trụ 6: Forensic Cơ bản (0..15)
+    if f_score is not None:
+        p6 = clip((f_score / 9.0) * 15.0, 0, 15)
+        qw_score = round(tech_total + p6)
+    else:
+        qw_score = round((tech_total / 85.0) * 99.0)
+
+    return int(clip(qw_score, 1, 99))
 
 
-def compute_forensic_scores(fin_curr, fin_prev, company_type=""):
-    is_financial = str(company_type or "").upper() in (
-        "BANK", "INSURANCE", "SECURITIES", "NGÂN HÀNG", "CHỨNG KHOÁN"
-    )
-
-    f_score = 0
-    roa_c, roa_p = _num(fin_curr, "roa", "ROA"), _num(fin_prev, "roa", "ROA")
-    cfo_c = _num(fin_curr, "cashFlowFromOperating", "operatingCashFlow", "cfo")
-    ni_c = _num(fin_curr, "netIncome", "profitAfterTax", "netProfit")
-    lev_c, lev_p = _num(fin_curr, "debtToEquity", "totalDebtToAssets"), _num(fin_prev, "debtToEquity", "totalDebtToAssets")
-    cr_c, cr_p = _num(fin_curr, "currentRatio"), _num(fin_prev, "currentRatio")
-    gm_c, gm_p = _num(fin_curr, "grossProfitMargin", "grossMargin"), _num(fin_prev, "grossProfitMargin", "grossMargin")
-    at_c, at_p = _num(fin_curr, "assetTurnover"), _num(fin_prev, "assetTurnover")
-    sh_c, sh_p = _num(fin_curr, "sharesOutstanding"), _num(fin_prev, "sharesOutstanding")
-
-    if roa_c is not None and roa_c > 0: f_score += 1
-    if cfo_c is not None and cfo_c > 0: f_score += 1
-    if roa_c is not None and roa_p is not None and roa_c > roa_p: f_score += 1
-    if cfo_c is not None and ni_c is not None and cfo_c > ni_c: f_score += 1
-    if lev_c is not None and lev_p is not None and lev_c <= lev_p: f_score += 1
-    if cr_c is not None and cr_p is not None and cr_c > cr_p: f_score += 1
-    if sh_c is not None and sh_p is not None and sh_c <= sh_p: f_score += 1
-    if gm_c is not None and gm_p is not None and gm_c > gm_p: f_score += 1
-    if at_c is not None and at_p is not None and at_c > at_p: f_score += 1
-
-    z_score = None
-    if not is_financial:
-        ta = _num(fin_curr, "totalAssets")
-        wc = _num(fin_curr, "workingCapital")
-        re = _num(fin_curr, "retainedEarnings")
-        ebit = _num(fin_curr, "ebit", "operatingProfit")
-        mcap = _num(fin_curr, "marketCap")
-        tl = _num(fin_curr, "totalLiabilities")
-        rev = _num(fin_curr, "revenue", "netSales")
-        if ta and ta > 0 and tl and tl > 0:
-            x1 = (wc or 0) / ta
-            x2 = (re or 0) / ta
-            x3 = (ebit or 0) / ta
-            x4 = (mcap or 0) / tl
-            x5 = (rev or 0) / ta
-            z_score = round(1.2 * x1 + 1.4 * x2 + 3.3 * x3 + 0.6 * x4 + 1.0 * x5, 2)
-
-    m_score = None
-    if not is_financial:
-        rev_c, rev_p = _num(fin_curr, "revenue", "netSales"), _num(fin_prev, "revenue", "netSales")
-        rec_c, rec_p = _num(fin_curr, "accountsReceivable", "shortTermReceivables"), _num(fin_prev, "accountsReceivable", "shortTermReceivables")
-        ta_c = _num(fin_curr, "totalAssets")
-        if rev_c and rev_p and rev_p > 0 and ta_c and ta_c > 0:
-            sgi = rev_c / rev_p
-            dsri = ((rec_c or 0) / rev_c) / (((rec_p or 0) / rev_p) or 1e-6) if rec_c and rec_p else 1.0
-            gmi = (gm_p / gm_c) if (gm_c and gm_p and gm_c > 0) else 1.0
-            tata = ((ni_c or 0) - (cfo_c or 0)) / ta_c
-            m_score = round(-4.84 + 0.92 * dsri + 0.528 * gmi + 0.892 * sgi + 4.679 * tata, 2)
-
-    return f_score, z_score, m_score
-
-
-# ----------------------------------------------------------------------------
-# 3. CHẠY TỔNG HỢP & CHỐT KIỂM TOÁN BẤT BIẾN (SHA-256)
-# ----------------------------------------------------------------------------
 def run_daily_analytics():
-    since = (date.today() - timedelta(days=180)).isoformat()
-    print(f"[1/3] Tải OHLCV 180 ngày gần nhất (từ {since}) từ Supabase...")
-    ohlcv = sb_fetch_all("ledger_ohlcv_daily", "symbol,trade_date,adj_close", f"&trade_date=gte.{since}")
+    since = (date.today() - timedelta(days=365)).isoformat()
+    print(f"[1/3] Tải OHLCV 1 năm gần nhất (từ {since}) từ Supabase...")
+    ohlcv = sb_fetch_all(
+        "ledger_ohlcv_daily",
+        "symbol,trade_date,high_raw,low_raw,adj_close,volume",
+        f"&trade_date=gte.{since}",
+    )
     if not ohlcv:
-        raise RuntimeError("Bảng ledger_ohlcv_daily đang trống. Hãy chạy Backfill Bước 1 trước!")
+        raise RuntimeError("Bảng ledger_ohlcv_daily đang trống!")
 
     df = pd.DataFrame(ohlcv)
     latest_date = df["trade_date"].max()
     pivot = df.pivot_table(index="trade_date", columns="symbol", values="adj_close").sort_index()
     rrg_map = compute_jdk_rrg(pivot)
-    print(f"   -> Đã tính RRG cho {len(rrg_map)} mã tại ngày chốt sổ {latest_date}.")
+    print(f"  -> Tính xong RRG cho {len(rrg_map)} mã tại ngày {latest_date}.")
 
-    print("[2/3] Tải BCTC năm gần nhất & chấm điểm Forensic (F/Z/M-Score)...")
-    fin_rows = sb_fetch_all("ledger_financials_pit", "symbol,year,company_type,financial_values", "&quarter=eq.0&order=year.desc")
-    fin_by_sym = {}
-    for r in fin_rows:
-        fin_by_sym.setdefault(r["symbol"], []).append(r)
+    print("[2/3] Kéo điểm cơ bản (VNDirect Finfo) & chấm điểm 6 Trụ cột QuantWe (1-99)...")
+    f_map = fetch_vndirect_fscores(list(rrg_map.keys()))
 
+    grouped = {sym: g.sort_values("trade_date") for sym, g in df.groupby("symbol")}
     audit_records = []
-    for sym, (rs_r, rs_m, quad) in rrg_map.items():
-        f_list = fin_by_sym.get(sym, [])
-        f_score, z_score, m_score = None, None, None
-        if len(f_list) >= 2:
-            f_score, z_score, m_score = compute_forensic_scores(
-                f_list[0]["financial_values"],
-                f_list[1]["financial_values"],
-                f_list[0].get("company_type", ""),
-            )
 
-        quad_pts = {"LEADING": 45, "IMPROVING": 35, "WEAKENING": 20, "LAGGING": 10}[quad]
-        f_pts = int((f_score or 4) * 5.5)
-        qw_score = max(0, min(100, quad_pts + f_pts))
+    for sym, (rs_r, rs_m, quad) in rrg_map.items():
+        sym_df = grouped.get(sym)
+        if sym_df is None or len(sym_df) < 25:
+            continue
+        f_score = f_map.get(sym)
+        qw_score = score_6_pillars(sym_df, rs_r, rs_m, quad, f_score)
 
         core = {
             "symbol": sym,
@@ -207,8 +230,8 @@ def run_daily_analytics():
             "rs_ratio": rs_r,
             "rs_momentum": rs_m,
             "f_score": f_score,
-            "z_score": z_score,
-            "m_score": m_score,
+            "z_score": None,
+            "m_score": None,
         }
         core["payload_hash"] = hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()
         audit_records.append(core)
@@ -217,14 +240,14 @@ def run_daily_analytics():
     url = f"{SUPABASE_URL}/rest/v1/ledger_signals_audit"
     hdr_write = sb_headers(write=True)
     for i in range(0, len(audit_records), 200):
-        r = requests.post(url, headers=hdr_write, json=audit_records[i : i + 200], timeout=30)
+        r = http_req.post(url, headers=hdr_write, json=audit_records[i : i + 200], timeout=30)
         if r.status_code not in (200, 201, 204):
             print(f"  [WARN] batch {i}: {r.status_code} {r.text[:200]}")
 
-    top5 = sorted(audit_records, key=lambda x: x["qw_score"], reverse=True)[:5]
-    print("\n[HOÀN TẤT] Top 5 mã QW Score cao nhất hôm nay:")
-    for t in top5:
-        print(f"  - {t['symbol']:4s} | QW: {t['qw_score']:3d} | RRG: {t['rrg_quadrant']:9s} (RS={t['rs_ratio']}, Mom={t['rs_momentum']}) | F={t['f_score']} | Z={t['z_score']}")
+    top8 = sorted(audit_records, key=lambda x: x["qw_score"], reverse=True)[:8]
+    print("\n[HOÀN TẤT] Top 8 mã QW Score 6 Trụ cột hôm nay:")
+    for t in top8:
+        print(f"  - {t['symbol']:4s} | QW: {t['qw_score']:2d}/99 | RRG: {t['rrg_quadrant']:9s} (RS={t['rs_ratio']}, Mom={t['rs_momentum']}) | F={t['f_score']}")
 
 
 if __name__ == "__main__":
