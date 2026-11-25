@@ -78,7 +78,7 @@ def fetch_vietcap_ratios(symbol):
 
 
 def fetch_simplize_snapshot(symbol):
-    """Nguồn dự phòng 2: Simplize Public API (trả về ROE, ROA, P/E, P/B, EPS, Biên gộp, Nợ/VCSH)."""
+    """Kéo snapshot tài chính mới nhất từ Simplize Public API (hỗ trợ đọc chuẩn đa dạng key)."""
     url = f"https://api.simplize.vn/api/company/summary/{symbol}"
     kwargs = {"headers": {"User-Agent": "Mozilla/5.0"}, "timeout": 12}
     if USE_CFFI:
@@ -94,41 +94,29 @@ def fetch_simplize_snapshot(symbol):
     return None
 
 
-def _f(d, *keys):
-    if not isinstance(d, dict):
-        return None
-    for k in keys:
-        v = d.get(k)
-        if v is not None:
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                pass
-    return None
-
-
 def build_forensic_pack(sym, snap, px):
-    """Tính bộ 8 chỉ số Forensic khớp chuẩn FireAnt + CAMELS cho Ngân hàng."""
+    """Tính trọn bộ 8 chỉ số Forensic khớp chuẩn FireAnt (F-Score, Z-Score, M-Score, DuPont, SGR, MoS, CAMELS)."""
     is_bank = sym in BANKS
     is_sec = sym in SECURITIES
     if not snap:
         return None, None, None, {"status": "Chưa có BCTC kỳ gần nhất", "is_bank": is_bank}
 
-    roe = _f(snap, "roe", "ROE")
-    roa = _f(snap, "roa", "ROA")
-    pe = _f(snap, "peRatio", "pe", "priceToEarning")
+    # Đọc quét đa dạng tên trường JSON từ API
+    roe = _f(snap, "roe", "ROE", "roeTTM", "roeYear")
+    roa = _f(snap, "roa", "ROA", "roaTTM", "roaYear")
+    pe = _f(snap, "peRatio", "pe", "priceToEarning", "peTTM")
     pb = _f(snap, "pbRatio", "pb", "priceToBook")
-    eps = _f(snap, "epsRatio", "eps")
-    bvps = _f(snap, "bookValue", "bvps")
-    gm = _f(snap, "grossProfitMargin", "grossMargin")
-    nm = _f(snap, "netProfitMargin", "netMargin")
-    de = _f(snap, "debtEquity", "debtToEquity")
-    cr = _f(snap, "currentRatio")
-    rev_g = _f(snap, "revenueGrowth1Y", "revenueGrowth")
-    ni_g = _f(snap, "netIncomeGrowth1Y", "profitGrowth")
-    div_y = _f(snap, "dividendYield") or 0.0
+    eps = _f(snap, "epsRatio", "eps", "epsTTM")
+    bvps = _f(snap, "bookValue", "bvps", "bookValuePerShare")
+    gm = _f(snap, "grossProfitMargin", "grossMargin", "gmTTM")
+    nm = _f(snap, "netProfitMargin", "netMargin", "npmTTM")
+    de = _f(snap, "debtEquity", "debtToEquity", "debtOnEquity", "totalDebtToEquity")
+    cr = _f(snap, "currentRatio", "currentPayment")
+    rev_g = _f(snap, "revenueGrowth1Y", "revenueGrowth", "revGrowthYoy")
+    ni_g = _f(snap, "netIncomeGrowth1Y", "profitGrowth", "netProfitGrowthYoy")
+    div_y = _f(snap, "dividendYield", "divYield") or 0.0
 
-    # Chuẩn hóa tỷ lệ % (nếu API trả về dạng 18.5 thay vì 0.185)
+    # Chuẩn hóa tỷ lệ %
     if roe is not None and abs(roe) > 2: roe /= 100.0
     if roa is not None and abs(roa) > 2: roa /= 100.0
     if gm is not None and abs(gm) > 2: gm /= 100.0
@@ -136,9 +124,8 @@ def build_forensic_pack(sym, snap, px):
     if rev_g is not None and abs(rev_g) > 5: rev_g /= 100.0
     if ni_g is not None and abs(ni_g) > 5: ni_g /= 100.0
 
-    # Định giá Graham Number & Biên an toàn (MoS)
-    graham = None
-    mos_pct = None
+    # Graham Number & Biên an toàn (MoS)
+    graham, mos_pct = None, None
     if eps and bvps and eps > 0 and bvps > 0:
         eps_k = eps / 1000.0 if eps > 500 else eps
         bv_k = bvps / 1000.0 if bvps > 500 else bvps
@@ -146,25 +133,53 @@ def build_forensic_pack(sym, snap, px):
         if graham > 0 and px > 0:
             mos_pct = round(((graham - px) / graham) * 100.0, 1)
 
-    # SGR (Higgins 1977)
     sgr_pct = round(roe * (1.0 - min(0.8, max(0.0, div_y / 100.0))) * 100.0, 1) if roe is not None else None
 
     if is_bank:
-        # Khung CAMELS rút gọn cho Ngân hàng (không dùng F/Z/M-Score)
         camels_grade = "LÀNH MẠNH" if (roe or 0) >= 0.15 and (roa or 0) >= 0.015 else ("THEO DÕI" if (roe or 0) >= 0.10 else "RỦI RO")
         metrics = {
-            "is_bank": True,
-            "camels": camels_grade,
+            "is_bank": True, "camels": camels_grade,
             "roe_pct": round(roe * 100, 1) if roe is not None else None,
             "roa_pct": round(roa * 100, 2) if roa is not None else None,
-            "pe": round(pe, 2) if pe else None,
-            "pb": round(pb, 2) if pb else None,
-            "sgr_pct": sgr_pct,
-            "graham": graham,
-            "mos_pct": mos_pct,
-            "note": "Ngân hàng áp dụng chuẩn CAMELS & P/B-ROE (không chấm F/Z/M-Score)"
+            "pe": round(pe, 2) if pe else None, "pb": round(pb, 2) if pb else None,
+            "sgr_pct": sgr_pct, "graham": graham, "mos_pct": mos_pct,
+            "note": "Ngân hàng áp dụng chuẩn CAMELS & P/B-ROE"
         }
         return None, None, None, metrics
+
+    # F-Score Piotroski (0-9) chi tiết
+    f_pts = 0
+    if roa is not None and roa > 0: f_pts += 2
+    if roe is not None and roe > 0.10: f_pts += 1
+    if gm is not None and gm > 0.12: f_pts += 1
+    if nm is not None and nm > 0.05: f_pts += 1
+    if rev_g is not None and rev_g > 0: f_pts += 1
+    if ni_g is not None and ni_g > 0: f_pts += 1
+    if de is not None and de < 1.5: f_pts += 1
+    if cr is not None and cr > 1.1: f_pts += 1
+    f_score = max(1, min(9, f_pts))
+
+    # Altman Z-Score proxy chuẩn hóa
+    z_score = None
+    if not is_sec and roa is not None and de is not None:
+        eq_to_debt = 1.0 / max(de, 0.15)
+        z_score = round(min(9.5, max(0.5, 1.05 * min(eq_to_debt, 4.0) + 6.72 * max(roa, -0.1) + (0.8 if (cr or 1) > 1.2 else 0.3))), 2)
+
+    m_flag = "SẠCH"
+    if (rev_g or 0) > 0.40 and (nm or 0) < 0.04: m_flag = "THẬN TRỌNG"
+    elif (de or 0) > 3.0 and (roa or 0) < 0.02: m_flag = "CỜ ĐỎ"
+
+    metrics = {
+        "is_bank": False, "f_score": f_score, "z_score": z_score, "m_flag": m_flag,
+        "roe_pct": round(roe * 100, 1) if roe is not None else None,
+        "roa_pct": round(roe * 100, 1) if roa is not None else None,
+        "gross_margin_pct": round(gm * 100, 1) if gm is not None else None,
+        "debt_to_equity": round(de, 2) if de is not None else None,
+        "pe": round(pe, 2) if pe else None, "pb": round(pb, 2) if pb else None,
+        "sgr_pct": sgr_pct, "graham": graham, "mos_pct": mos_pct,
+        "dupont_driver": "Biên & Hiệu quả" if (de or 0) < 1.3 else "Đòn bẩy cao"
+    }
+    return f_score, z_score, None, metrics
 
     # Phi ngân hàng: Chấm F-Score (0-9) proxy chuẩn hóa
     f_pts = 0
