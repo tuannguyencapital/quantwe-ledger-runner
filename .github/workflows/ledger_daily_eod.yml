@@ -1,0 +1,51 @@
+name: QuantWe Immutable Ledger Daily EOD (15:20 ICT)
+
+on:
+  schedule:
+    - cron: '20 8 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      force_full:
+        description: 'Ép chạy lại Full Backfill 10 năm (0 = Tự động, 1 = Chạy lại toàn bộ)'
+        required: false
+        default: '0'
+
+jobs:
+  eod-ledger-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -q curl_cffi requests pandas numpy pyarrow
+
+      - name: 1. Backfill / Sync EOD OHLCV, Dividends & Financials (No Token)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          FORCE_FULL_BACKFILL: ${{ github.event.inputs.force_full || '0' }}
+        run: python scripts/quantwe_ledger_backfill.py
+
+      - name: 2. Compute RRG, F/Z/M-Score & Audit Hash
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          if [ -f scripts/quantwe_ledger_analytics.py ]; then
+            python scripts/quantwe_ledger_analytics.py
+          else
+            echo "Bỏ qua bước 2 vì chưa tạo scripts/quantwe_ledger_analytics.py"
+          fi
+
+      - name: 3. Upload Cold Backup Artifact (Parquet + SHA-256)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quantwe-immutable-backup-${{ github.run_id }}
+          path: immutable_backup/
+          retention-days: 90
